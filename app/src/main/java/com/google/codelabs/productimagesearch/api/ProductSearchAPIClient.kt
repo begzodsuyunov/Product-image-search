@@ -63,7 +63,10 @@ class ProductSearchAPIClient(context: Context){
      * Convert an image to its Base64 representation
      */
     private fun convertBitmapToBase64(bitmap: Bitmap): String {
-        return ""
+        val byteArrayOutputStream = ByteArrayOutputStream()
+        bitmap.compress(Bitmap.CompressFormat.PNG, 100, byteArrayOutputStream)
+        val byteArray: ByteArray = byteArrayOutputStream.toByteArray()
+        return Base64.encodeToString(byteArray, Base64.DEFAULT)
     }
 
     /**
@@ -71,7 +74,72 @@ class ProductSearchAPIClient(context: Context){
      * Call the projects.locations.images.annotate endpoint.
      */
     fun annotateImage(image: Bitmap): Task<List<ProductSearchResult>> {
-        return TaskCompletionSource<List<ProductSearchResult>>().task
+        // Initialization to use the Task API
+        val apiSource = TaskCompletionSource<List<ProductSearchResult>>()
+        val apiTask = apiSource.task
+
+        // Convert the query image to its Base64 representation to call the Product Search API.
+        val base64: String = convertBitmapToBase64(image)
+
+        // Craft the request body JSON.
+        val requestJson = """
+        {
+          "requests": [
+            {
+              "image": {
+                "content": """".trimIndent() + base64 + """"
+              },
+              "features": [
+                {
+                  "type": "PRODUCT_SEARCH",
+                  "maxResults": $VISION_API_PRODUCT_MAX_RESULT
+                }
+              ],
+              "imageContext": {
+                "productSearchParams": {
+                  "productSet": "projects/${VISION_API_PROJECT_ID}/locations/${VISION_API_LOCATION_ID}/productSets/${VISION_API_PRODUCT_SET_ID}",
+                  "productCategories": [
+                       "apparel-v2"
+                     ]
+                }
+              }
+            }
+          ]
+        }
+    """.trimIndent()
+
+        // Add a new request to the queue
+        requestQueue.add(object :
+            JsonObjectRequest(
+                Method.POST,
+                "$VISION_API_URL/images:annotate?key=$VISION_API_KEY",
+                JSONObject(requestJson),
+                { response ->
+                    // Parse the API JSON response to a list of ProductSearchResult object/
+                    val productList = apiResponseToObject(response)
+
+                    // Return the list.
+                    // Loop through the product list and create tasks to load reference images.
+                    // We will call the projects.locations.products.referenceImages.get endpoint
+                    // for each product.
+                    val fetchReferenceImageTasks = productList.map { fetchReferenceImage(it) }
+
+                    // When all reference image fetches have completed,
+                    // return the ProductSearchResult list
+                    Tasks.whenAllComplete(fetchReferenceImageTasks)
+                        // Return the list of ProductSearchResult with product images' HTTP URLs.
+                        .addOnSuccessListener { apiSource.setResult(productList) }
+                        // An error occurred so returns it to the caller.
+                        .addOnFailureListener { apiSource.setException(it) }                },
+                // Return the error
+                { error -> apiSource.setException(error) }
+            ) {
+            override fun getBodyContentType() = "application/json"
+        }.apply {
+            setShouldCache(false)
+        })
+
+        return apiTask
     }
 
     /**
@@ -79,7 +147,40 @@ class ProductSearchAPIClient(context: Context){
      * Call the projects.locations.products.referenceImages.get endpoint
      */
     private fun fetchReferenceImage(searchResult: ProductSearchResult): Task<ProductSearchResult> {
-        return TaskCompletionSource<ProductSearchResult>().task
+        // Initialization to use the Task API
+        val apiSource = TaskCompletionSource<ProductSearchResult>()
+        val apiTask = apiSource.task
+
+        // Craft the API request to get details about the reference image of the product
+        val stringRequest = object : StringRequest(
+            Method.GET,
+            "$VISION_API_URL/${searchResult.imageId}?key=$VISION_API_KEY",
+            { response ->
+                val responseJson = JSONObject(response)
+                val gcsUri = responseJson.getString("uri")
+
+                // Convert the GCS URL to its HTTPS representation
+                val httpUri = gcsUri.replace("gs://", "https://storage.googleapis.com/")
+
+                // Save the HTTPS URL to the search result object
+                searchResult.imageUri = httpUri
+
+                // Invoke the listener to continue with processing the API response (eg. show on UI)
+                apiSource.setResult(searchResult)
+            },
+            { error -> apiSource.setException(error) }
+        ) {
+
+            override fun getBodyContentType(): String {
+                return "application/json; charset=utf-8"
+            }
+        }
+        Log.d(ProductSearchActivity.TAG, "Sending API request.")
+
+        // Add the request to the RequestQueue.
+        requestQueue.add(stringRequest)
+
+        return apiTask
     }
 
     /**
